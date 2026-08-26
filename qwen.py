@@ -86,21 +86,22 @@ class SelfAttention(nn.Module):
         ): 
         super().__init__();
         self.hidden_size = config.hidden_size
-        self.num_attention_heads = self.num_attention_heads # because attn heads != k_heads/q_heads in GQA
-        self.head_dim = self.head_dim # head dim remains const even in GQA
-        self.num_kv_heads = self.num_kv_heads
-        self.num_kv_groups = self.num_attention_heads // self.num_kv_heads # number of kv heads per q head
+        self.num_attention_heads = config.num_attention_heads # because attn heads != k_heads/q_heads in GQA
+        self.head_dim = config.head_dim # head dim remains const even in GQA
+        self.num_kv_heads = config.num_kv_heads
+        self.num_kv_groups = config.num_attention_heads // self.num_kv_heads # number of kv heads per q head
 
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        self.rope = RoPE(config)
 
-        self.q_proj = nn.Linear(self.hidden_size, self.head_dim * self.attention_heads * 2)
+        self.q_proj = nn.Linear(self.hidden_size, self.head_dim * self.num_attention_heads)
 
         # normally, hidden_size = head_dim * num_heads, but in GQA, we want to 
         # project k, v into a smaller dim to conserve space. our head_dim remains the same, 
         # but we have less heads. Thus, head_dim * num_kv_heads < hidden_size 
-        self.k = nn.Linear(self.hidden_size, self.head_dim * self.num_kv_heads)
-        self.v = nn.Linear(self.hidden_size, self.head_dim * self.num_kv_heads)
+        self.k_proj = nn.Linear(self.hidden_size, self.head_dim * self.num_kv_heads, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.head_dim * self.num_kv_heads, bias=config.attention_bias)
 
         # input to out proj is the concatenation of all attn heads (num_heads * head_dim -> hidden_size)
         self.proj_out = nn.Linear(self.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
@@ -108,19 +109,46 @@ class SelfAttention(nn.Module):
     def forward(
         self,
         hidden_states : torch.Tensor,
-        pos_embedding,
-        attention_mask: torch.Tensor | None = None,
+        position_ids,
+        attention_mask: torch.Tensor,
         cache = None
     ):
         
         batch_size, seq_len, _ = hidden_states.shape
-        q_proj = self.q_proj(hidden_states)
-        q, gate = torch.chunk(q_proj, 2, dim=-1)
-        gate = gate.reshape(batch_size, seq_len, -1)
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
         
-        q = self.q_norm(q.reshape(batch_size, seq_len, self.num_attention_heads, self.head_dim))).transpose(1, 2)
-        k = self.k_norm(k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim))).transpose(1, 2)
-        v = self.v_norm(v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim))).transpose(1, 2)
+        q = self.q_norm(q.reshape(batch_size, seq_len, self.num_attention_heads, self.head_dim)).transpose(1, 2)
+        k = self.k_norm(k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)).transpose(1, 2)
+        v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        q = self.rope(q, position_ids) 
+        k = self.rope(k, position_ids) 
+
+        if cache is not None:
+            k, v = cache.update(k, v, self.layer_idx)
+
+        k = k.repeat_interleave(self.num_kv_groups, dim=1)
+        v = v.repeat_interleave(self.num_kv_groups, dim=1)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) # transpose last 2 dims 
+
+        attn_scores = attn_scores + attention_mask 
+        attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
+
+        attn_output = torch.matmul(attn_weights, v)
+
+        # merge query heads and project
+        attn_output = attn_output.transpose(1, 2).contiguous() 
+        attn_output = attn_output.view(
+            batch_size,
+            seq_len,
+            self.num_attention_heads * self.head_dim
+        )
+
+        attn_output = self.proj_out(attn_output)
+        
+
 
 class GatedDeltaNet(nn.Module):
     def __init__(
