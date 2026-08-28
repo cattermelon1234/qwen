@@ -11,7 +11,7 @@ class RMSNorm(nn.Module):
             eps: float = 1e-6
         ):
             super().__init__()
-            self.weight = nn.Parameter(torch.zeros(dim)); # tells pytorch weight is learnable
+            self.weight = nn.Parameter(torch.ones(dim)); # tells pytorch weight is learnable
             self.eps = eps
 
     def _norm(self, x: torch.Tensor):
@@ -23,7 +23,7 @@ class RMSNorm(nn.Module):
         x: torch.Tensor
         ):
             normalized = self._norm(x)
-            return normalized * (1.0 + self.weight)
+            return normalized * self.weight
 
 
 class RoPE(nn.Module):
@@ -83,20 +83,25 @@ class RoPE(nn.Module):
 
 class SelfAttention(nn.Module):
     def __init__(
-        self, config
+        self, config, layer_idx
         ): 
         super().__init__();
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads # because attn heads != k_heads/q_heads in GQA
         self.head_dim = config.head_dim # head dim remains const even in GQA
-        self.num_kv_heads = config.num_kv_heads
+        self.num_kv_heads = config.num_key_value_heads
         self.num_kv_groups = config.num_attention_heads // self.num_kv_heads # number of kv heads per q head
 
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.rope = RoPE(config)
 
-        self.q_proj = nn.Linear(self.hidden_size, self.head_dim * self.num_attention_heads)
+        self.q_proj = nn.Linear(
+            self.hidden_size,
+            self.head_dim * self.num_attention_heads,
+            bias=config.attention_bias,
+        )
 
         # normally, hidden_size = head_dim * num_heads, but in GQA, we want to 
         # project k, v into a smaller dim to conserve space. our head_dim remains the same, 
@@ -129,7 +134,7 @@ class SelfAttention(nn.Module):
         k = self.rope(k, position_ids) 
 
         if cache is not None:
-            k, v = cache.update(k, v, self.layer_idx)
+            k, v = cache.update(k, v, self.layer_idx, position_ids)
 
         k = k.repeat_interleave(self.num_kv_groups, dim=1) # repeats k, v heads since multiple q heads map to one k/v in GQA
         v = v.repeat_interleave(self.num_kv_groups, dim=1)
@@ -152,25 +157,17 @@ class SelfAttention(nn.Module):
         attn_output = self.proj_out(attn_output)
         return attn_output
 
-class QwenMLP:
+class QwenMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size) 
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         
     def forward(self, x):
             return self.down_proj(
                 F.silu(self.gate_proj(x)) * self.up_proj(x)
             )
-        
-
-class GatedDeltaNet(nn.Module):
-    def __init__(
-        self,
-        config,
-    ):
-        super().__init__()
 
 class DynamicCache(nn.Module):
     def __init__(self, config, batch_size, device, dtype):
@@ -179,17 +176,17 @@ class DynamicCache(nn.Module):
         self.k_cache = []
         self.v_cache = []
 
-        for layer_idx in range(config.num_layers):
-            self.k_cache[layer_idx] = torch.empty(
+        for _ in range(config.num_hidden_layers):
+            self.k_cache.append(torch.empty(
                 batch_size,
-                self.config.num_kv_heads,
-                self.config.max_seq_len,
+                self.config.num_key_value_heads,
+                self.config.max_position_embeddings,
                 self.config.head_dim,
                 device=device,
                 dtype=dtype,
-            )
+            ))
 
-            self.v_cache[layer_idx] = torch.empty_like(self.k_cache[layer_idx])       
+            self.v_cache.append(torch.empty_like(self.k_cache[-1]))
 
     def update(self, k, v, layer_idx, position_ids):
         # k/v: [B, Hkv, new_seq_len, D]
@@ -217,12 +214,83 @@ class DynamicCache(nn.Module):
 
         return k, v
 
-class TextModel(nn.Module):
-    def __init__(
-        self,
-        config
-    ):
+class TransformerBlock(nn.Module):
+    def __init__(self, config, layer_idx):
         super().__init__();
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.attention = SelfAttention(config, layer_idx)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size,
+            config.rms_norm_eps,
+        )
+        self.mlp = QwenMLP(config)
+
+    def forward(self, hidden_states, position_ids, attention_mask, cache=None):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        hidden_states = self.attention(hidden_states, position_ids, attention_mask, cache)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = hidden_states + residual
+
+        return hidden_states
+
+class Qwen(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.config = config
+
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size,
+            config.hidden_size,
+        )
+
+        self.layers = nn.ModuleList([
+            TransformerBlock(config, layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
+        ])
+
+        self.norm = RMSNorm(
+            config.hidden_size,
+            config.rms_norm_eps,
+        )
+
+        self.lm_head = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+        )
+
+    def forward(
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        cache=None,
+    ):
+        # [B, S] -> [B, S, hidden_size]
+        hidden_states = self.embed_tokens(input_ids)
+
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                position_ids,
+                attention_mask,
+                cache,
+            )
+
+        hidden_states = self.norm(hidden_states)
+
+        # [B, S, hidden_size] -> [B, S, vocab_size]
+        logits = self.lm_head(hidden_states)
+
+        return logits
+
 
 if __name__ == "__main__":
     config = QwenConfig() 
