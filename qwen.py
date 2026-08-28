@@ -153,18 +153,32 @@ class SelfAttention(nn.Module):
 class GatedDeltaNet(nn.Module):
     def __init__(
         self,
-        config
+        config,
     ):
         super().__init__()
 
-
 class DynamicCache(nn.Module):
-    def __init__(
-        self,
-        config
-    ):
-        super().__init__();
+    def __init__(self, config, batch_size, device, dtype):
+        super().__init__()
+        self.config = config
+        self.k_cache = torch.empty(
+            batch_size,
+            self.config.num_kv_heads,
+            self.config.max_seq_len,
+            self.config.head_dim,
+            device=device,
+            dtype=dtype,
+        )
 
+        self.v_cache = torch.empty_like(self.k_cache)       
+
+    def update(self, k, v, position):
+        # k, v [b, n_heads, seq_len, head_dim]
+        self.k_cache[:k.shape[0], :, position: position + k.shape[2],:]
+        self.v_cache[:v.shape[0], :, position: position + v.shape[2],:]
+
+    def fetch(self, end_position):
+        k = self.k_cache[:, :, :end_position, :]
 
 class TextModel(nn.Module):
     def __init__(
