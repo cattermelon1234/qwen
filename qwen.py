@@ -2,6 +2,7 @@ import torch
 from torch import nn 
 import torch.nn.functional as F 
 from config import QwenConfig
+import math
 
 class RMSNorm(nn.Module):
     def __init__(
@@ -111,7 +112,7 @@ class SelfAttention(nn.Module):
         hidden_states : torch.Tensor,
         position_ids,
         attention_mask: torch.Tensor,
-        cache = None
+        cache = None,
     ):
         
         batch_size, seq_len, _ = hidden_states.shape
@@ -119,6 +120,7 @@ class SelfAttention(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
         
+        # new k, v to append to the k/v cache
         q = self.q_norm(q.reshape(batch_size, seq_len, self.num_attention_heads, self.head_dim)).transpose(1, 2)
         k = self.k_norm(k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)).transpose(1, 2)
         v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -129,9 +131,10 @@ class SelfAttention(nn.Module):
         if cache is not None:
             k, v = cache.update(k, v, self.layer_idx)
 
-        k = k.repeat_interleave(self.num_kv_groups, dim=1)
+        k = k.repeat_interleave(self.num_kv_groups, dim=1) # repeats k, v heads since multiple q heads map to one k/v in GQA
         v = v.repeat_interleave(self.num_kv_groups, dim=1)
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) # transpose last 2 dims 
+        attn_scores = attn_scores / math.sqrt(self.head_dim) # scale by 1/sqrt(head_dim)
 
         attn_scores = attn_scores + attention_mask 
         attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
@@ -147,8 +150,20 @@ class SelfAttention(nn.Module):
         )
 
         attn_output = self.proj_out(attn_output)
-        
+        return attn_output
 
+class QwenMLP:
+    def __init__(self, config):
+        super().__init__()
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size) 
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size)
+        
+    def forward(self, x):
+            return self.down_proj(
+                F.silu(self.gate_proj(x)) * self.up_proj(x)
+            )
+        
 
 class GatedDeltaNet(nn.Module):
     def __init__(
@@ -161,24 +176,46 @@ class DynamicCache(nn.Module):
     def __init__(self, config, batch_size, device, dtype):
         super().__init__()
         self.config = config
-        self.k_cache = torch.empty(
-            batch_size,
-            self.config.num_kv_heads,
-            self.config.max_seq_len,
-            self.config.head_dim,
-            device=device,
-            dtype=dtype,
-        )
+        self.k_cache = []
+        self.v_cache = []
 
-        self.v_cache = torch.empty_like(self.k_cache)       
+        for layer_idx in range(config.num_layers):
+            self.k_cache[layer_idx] = torch.empty(
+                batch_size,
+                self.config.num_kv_heads,
+                self.config.max_seq_len,
+                self.config.head_dim,
+                device=device,
+                dtype=dtype,
+            )
 
-    def update(self, k, v, position):
-        # k, v [b, n_heads, seq_len, head_dim]
-        self.k_cache[:k.shape[0], :, position: position + k.shape[2],:]
-        self.v_cache[:v.shape[0], :, position: position + v.shape[2],:]
+            self.v_cache[layer_idx] = torch.empty_like(self.k_cache[layer_idx])       
 
-    def fetch(self, end_position):
-        k = self.k_cache[:, :, :end_position, :]
+    def update(self, k, v, layer_idx, position_ids):
+        # k/v: [B, Hkv, new_seq_len, D]
+
+        start = position_ids[0, 0].item()
+        end = start + k.shape[2]
+
+        # Write new K/V
+        self.k_cache[layer_idx][
+            :k.shape[0], :, start:end, :
+        ] = k
+
+        self.v_cache[layer_idx][
+            :v.shape[0], :, start:end, :
+        ] = v
+
+        # Fetch entire history
+        k = self.k_cache[layer_idx][
+            :k.shape[0], :, :end, :
+        ]
+
+        v = self.v_cache[layer_idx][
+            :v.shape[0], :, :end, :
+        ]
+
+        return k, v
 
 class TextModel(nn.Module):
     def __init__(
