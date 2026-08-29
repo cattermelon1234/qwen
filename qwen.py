@@ -134,7 +134,7 @@ class SelfAttention(nn.Module):
         k = self.rope(k, position_ids) 
 
         if cache is not None:
-            k, v = cache.update(k, v, self.layer_idx, position_ids)
+            k, v = cache.update(k, v, self.layer_idx)
 
         k = k.repeat_interleave(self.num_kv_groups, dim=1) # repeats k, v heads since multiple q heads map to one k/v in GQA
         v = v.repeat_interleave(self.num_kv_groups, dim=1)
@@ -173,46 +173,55 @@ class DynamicCache(nn.Module):
     def __init__(self, config, batch_size, device, dtype):
         super().__init__()
         self.config = config
-        self.k_cache = []
-        self.v_cache = []
+        self.batch_size = batch_size
+        self.seq_len = 0
+        empty_shape = (
+            batch_size,
+            config.num_key_value_heads,
+            0,
+            config.head_dim,
+        )
 
-        for _ in range(config.num_hidden_layers):
-            self.k_cache.append(torch.empty(
-                batch_size,
-                self.config.num_key_value_heads,
-                self.config.max_position_embeddings,
-                self.config.head_dim,
-                device=device,
-                dtype=dtype,
-            ))
+        for layer_idx in range(config.num_hidden_layers):
+            self.register_buffer(
+                f"k_cache_{layer_idx}",
+                torch.empty(empty_shape, device=device, dtype=dtype),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"v_cache_{layer_idx}",
+                torch.empty(empty_shape, device=device, dtype=dtype),
+                persistent=False,
+            )
 
-            self.v_cache.append(torch.empty_like(self.k_cache[-1]))
+    @property
+    def k_cache(self):
+        return [
+            getattr(self, f"k_cache_{layer_idx}")
+            for layer_idx in range(self.config.num_hidden_layers)
+        ]
 
-    def update(self, k, v, layer_idx, position_ids):
+    @property
+    def v_cache(self):
+        return [
+            getattr(self, f"v_cache_{layer_idx}")
+            for layer_idx in range(self.config.num_hidden_layers)
+        ]
+
+    def update(self, k, v, layer_idx):
         # k/v: [B, Hkv, new_seq_len, D]
+        cached_k = getattr(self, f"k_cache_{layer_idx}")
+        cached_v = getattr(self, f"v_cache_{layer_idx}")
 
-        start = position_ids[0, 0].item()
-        end = start + k.shape[2]
+        updated_k = torch.cat((cached_k, k), dim=2)
+        updated_v = torch.cat((cached_v, v), dim=2)
+        setattr(self, f"k_cache_{layer_idx}", updated_k)
+        setattr(self, f"v_cache_{layer_idx}", updated_v)
 
-        # Write new K/V
-        self.k_cache[layer_idx][
-            :k.shape[0], :, start:end, :
-        ] = k
+        if layer_idx == 0:
+            self.seq_len += k.shape[2]
 
-        self.v_cache[layer_idx][
-            :v.shape[0], :, start:end, :
-        ] = v
-
-        # Fetch entire history
-        k = self.k_cache[layer_idx][
-            :k.shape[0], :, :end, :
-        ]
-
-        v = self.v_cache[layer_idx][
-            :v.shape[0], :, :end, :
-        ]
-
-        return k, v
+        return updated_k, updated_v
 
 class TransformerBlock(nn.Module):
     def __init__(self, config, layer_idx):
@@ -238,6 +247,44 @@ class TransformerBlock(nn.Module):
         hidden_states = hidden_states + residual
 
         return hidden_states
+
+def make_attention_mask(
+      query_len,
+      past_len,
+      padding_mask,  # [B, K]
+      dtype,
+      device,
+  ):
+      kv_len = past_len + query_len
+
+      # Physical positions in the KV cache.
+      query_positions = (
+          past_len + torch.arange(query_len, device=device)
+      )  # [Q]
+
+      key_positions = torch.arange(kv_len, device=device)  # [K]
+
+      # [1, Q, K]
+      causal_allowed = (
+          key_positions[None, None, :]
+          <= query_positions[None, :, None]
+      )
+
+      # [B, 1, K]
+      key_is_real = padding_mask[:, None, :kv_len].bool()
+
+      # [B, Q, K]
+      allowed = causal_allowed & key_is_real
+
+      mask = torch.zeros(
+          allowed.shape,
+          dtype=dtype,
+          device=device,
+      )
+      mask.masked_fill_(~allowed, torch.finfo(dtype).min)
+
+      # [B, 1, Q, K]
+      return mask.unsqueeze(1)
 
 class Qwen(nn.Module):
     def __init__(self, config):
@@ -309,3 +356,15 @@ if __name__ == "__main__":
     rotated_query = rope(query, position_ids)
     print(rotated_query.shape)
     
+    batch_size, query_len = input_ids.shape 
+    kv_len = position_ids.max().item() + 1 
+
+    padding_mask = input_ids != config.pad_token_id
+    attention_mask = make_attention_mask(position_ids=position_ids, padding_mask=padding_mask, kv_len=kv_len, dtype=model.embed_tokens.weight.dtype, device=input_ids.device)
+
+    logits = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        cache=cache
+    )
