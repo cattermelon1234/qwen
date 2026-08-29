@@ -3,8 +3,8 @@ from dataclasses import dataclass
 @dataclass
 class QwenConfig:
   vocab_size: int = 151_936
-  hidden_size: int = 2_048
-  intermediate_size: int = 6_144
+  hidden_size: int = 1_024
+  intermediate_size: int = 3_072
   num_hidden_layers: int = 28
   num_attention_heads: int = 16
   num_key_value_heads: int = 8
@@ -15,6 +15,9 @@ class QwenConfig:
   attention_bias: bool = False
 
   tie_word_embeddings: bool = True
+  bos_token_id: int = 151_643
+  eos_token_id: int = 151_645
+  pad_token_id: int = 151_643
 
   def __post_init__(self):
       if self.hidden_size % self.num_attention_heads != 0:

@@ -154,6 +154,7 @@ class SelfAttention(nn.Module):
             self.num_attention_heads * self.head_dim
         )
 
+        # [B, query_len, hidden_dim]
         attn_output = self.proj_out(attn_output)
         return attn_output
 
@@ -165,6 +166,7 @@ class QwenMLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
         
     def forward(self, x):
+            # [B, query_len, hidden_dim]
             return self.down_proj(
                 F.silu(self.gate_proj(x)) * self.up_proj(x)
             )
@@ -246,6 +248,7 @@ class TransformerBlock(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = hidden_states + residual
 
+        # [B, query_len, D]
         return hidden_states
 
 def make_attention_mask(
@@ -313,6 +316,9 @@ class Qwen(nn.Module):
             bias=False,
         )
 
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
+
     def forward(
         self,
         input_ids,
@@ -333,11 +339,98 @@ class Qwen(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
-        # [B, S, hidden_size] -> [B, S, vocab_size]
+        # [B, query_len, hidden_size] -> [B, query_len, vocab_size]
         logits = self.lm_head(hidden_states)
 
         return logits
 
+    def generate(self, input_ids, max_new_tokens, padding_mask=None):
+        self.eval()
+
+        if max_new_tokens <= 0:
+            return input_ids
+
+        batch_size, query_len = input_ids.shape
+        if padding_mask is None:
+            padding_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        else:
+            padding_mask = padding_mask.bool()
+
+        cache = DynamicCache(
+            config=self.config,
+            batch_size=batch_size,
+            device=input_ids.device,
+            dtype=self.embed_tokens.weight.dtype,
+        )
+        generated = input_ids
+
+        with torch.inference_mode():
+            position_ids = padding_mask.long().cumsum(dim=-1) - 1
+            position_ids.masked_fill_(~padding_mask, 0)
+            attention_mask = make_attention_mask(
+                query_len=query_len,
+                past_len=0,
+                padding_mask=padding_mask,
+                dtype=self.embed_tokens.weight.dtype,
+                device=input_ids.device,
+            )
+            logits = self(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                cache=cache,
+            )
+
+            finished = torch.zeros(
+                batch_size,
+                dtype=torch.bool,
+                device=input_ids.device,
+            )
+
+            for step in range(max_new_tokens):
+                next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+                # torch.where(condition, A, B) replaces with A if cond is true at idx,
+                # replaces with B if cond is false.
+                # finished is [[true], [true], [false], ...] (batch_size x 1)
+                # next_token is [[batch_1_token], [batch_2_token], ...] (batch_size x 1)
+                # torch.full_like [[eos_token], [eos_token], [eos_token], ...]
+                next_token = torch.where(
+                    finished.unsqueeze(1),
+                    torch.full_like(next_token, self.config.pad_token_id),
+                    next_token,
+                )
+
+                generated = torch.cat((generated, next_token), dim=1)
+                padding_mask = torch.cat(
+                    (padding_mask, ~finished.unsqueeze(1)),
+                    dim=1,
+                )
+
+                finished = finished | (
+                    next_token.squeeze(1) == self.config.eos_token_id
+                )
+
+                if finished.all() or step == max_new_tokens - 1:
+                    break
+
+                past_len = cache.seq_len
+                position_ids = padding_mask.long().sum(dim=-1, keepdim=True) - 1
+                attention_mask = make_attention_mask(
+                    query_len=1,
+                    past_len=past_len,
+                    padding_mask=padding_mask,
+                    dtype=self.embed_tokens.weight.dtype,
+                    device=input_ids.device,
+                )
+                logits = self(
+                    input_ids=next_token,
+                    position_ids=position_ids,
+                    attention_mask=attention_mask,
+                    cache=cache,
+                )
+
+        return generated
 
 if __name__ == "__main__":
     config = QwenConfig() 
@@ -355,16 +448,3 @@ if __name__ == "__main__":
 
     rotated_query = rope(query, position_ids)
     print(rotated_query.shape)
-    
-    batch_size, query_len = input_ids.shape 
-    kv_len = position_ids.max().item() + 1 
-
-    padding_mask = input_ids != config.pad_token_id
-    attention_mask = make_attention_mask(position_ids=position_ids, padding_mask=padding_mask, kv_len=kv_len, dtype=model.embed_tokens.weight.dtype, device=input_ids.device)
-
-    logits = model(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        attention_mask=attention_mask,
-        cache=cache
-    )
