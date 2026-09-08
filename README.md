@@ -1,8 +1,10 @@
 # Qwen3 from scratch
 
 A PyTorch implementation of dense Qwen3 inference. Start with the official
-`Qwen/Qwen3-0.6B` checkpoint. Its head dimension is **128**, independently of
-`hidden_size / num_attention_heads`.
+`Qwen/Qwen3-0.6B` checkpoint.
+
+includes from scratch implementation of RoPE, RMSNorm, self attention, swiGLU, and dynamic, per-layer kv cache. 
+Self attention supports batching, eos token handling, token padding, and appropriate causal attention masking ignoring token pads. 
 
 ## Setup
 
@@ -10,8 +12,7 @@ A PyTorch implementation of dense Qwen3 inference. Start with the official
 uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
-The reference version is pinned to Transformers 4.57.6.
-PyTorch 2.13.0 was used during development.
+PyTorch 2.13.0 was used during dev process.
 
 ## Generate
 
