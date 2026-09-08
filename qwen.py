@@ -2,7 +2,6 @@ import torch
 from torch import nn 
 import torch.nn.functional as F 
 from config import QwenConfig
-import math
 
 class RMSNorm(nn.Module):
     def __init__(
@@ -16,7 +15,7 @@ class RMSNorm(nn.Module):
 
     def _norm(self, x: torch.Tensor):
         rms_inverse = torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps) # dim = -1 because last dim is token dim
-        return x * rms_inverse.to(dtype=x.dtype)
+        return (x.float() * rms_inverse).to(dtype=x.dtype)
 
     def forward(
         self,
@@ -27,57 +26,33 @@ class RMSNorm(nn.Module):
 
 
 class RoPE(nn.Module):
-    cos: torch.Tensor
-    sin: torch.Tensor
-    def __init__(
-        self,
-        config,
-    ):
-        super().__init__();
+    def __init__(self, config):
+        super().__init__()
+        self.head_dim = config.head_dim
+        self.theta = config.rope_theta
+        self.max_positions = config.max_position_embeddings
 
-        if (config.head_dim % 2 != 0):
-            raise ValueError("head_dim must be even for RoPE")
-
-        inv_freq = 1.0 / (
-            config.rope_theta ** (torch.arange(0, config.head_dim, 2) / config.head_dim)
-        )
-
-        positions = torch.arange(0, config.max_position_embeddings, dtype=torch.float32)
-
-        # [max_position_embeddings, head_dim / 2]
-        freqs = torch.outer(positions, inv_freq);
-
-        self.register_buffer(
-            "cos",
-            freqs.cos(),
-            persistent=False,
-        )
-        self.register_buffer(
-            "sin",
-            freqs.sin(),
-            persistent=False,
-        )
-
-    # x is input, cos/sin are precomputed rotation matrices for our given theta
     def apply_rotary_emb(self, x, cos, sin):
-        # torch.chunk splits head dim into 2 chunks [a, b, c, d] -> x1 = [a, b], x2 = [c, d]
-        x1, x2 = torch.chunk(x.float(), 2, dim=-1);
-        y1 = x1 * cos - x2 * sin
-        y2 = x2 * cos + x1 * sin
-
-        # RoPE doesn't require pairs to be strictly adjacent, we can set pairs to be (a, c), (b, d)
-        # which makes our life significantly easier. Now we just have to concat y1 and y2
-        return torch.cat((y1, y2), dim=-1).to(x.dtype);
+        x1, x2 = x.chunk(2, dim=-1)
+        rotated = torch.cat((-x2, x1), dim=-1)
+        return x * cos + rotated * sin
 
     def forward(self, x, position_ids):
-        # x is [batch_size, n_heads, seq_len, head_dim]
-        # pos_ids is [batch_size, seq_len]
-        cos = self.cos[position_ids]
-        sin = self.sin[position_ids]
-
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-
+        if (position_ids < 0).any() or (position_ids >= self.max_positions).any():
+            raise ValueError("position_ids exceed configured context range")
+        # Recompute frequencies in float32 so model.bfloat16() cannot round
+        # a stored frequency buffer. Only construct the requested positions.
+        device_type = x.device.type if x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            inv_freq = 1.0 / (self.theta ** (
+                torch.arange(0, self.head_dim, 2, device=x.device, dtype=torch.float32)
+                / self.head_dim
+            ))
+            freqs = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1) @ position_ids[:, None, :].float()
+            freqs = freqs.transpose(1, 2)
+            angles = torch.cat((freqs, freqs), dim=-1)
+            cos = angles.cos().to(x.dtype).unsqueeze(1)
+            sin = angles.sin().to(x.dtype).unsqueeze(1)
         return self.apply_rotary_emb(x, cos, sin)
 
 
@@ -103,9 +78,8 @@ class SelfAttention(nn.Module):
             bias=config.attention_bias,
         )
 
-        # normally, hidden_size = head_dim * num_heads, but in GQA, we want to 
-        # project k, v into a smaller dim to conserve space. our head_dim remains the same, 
-        # but we have less heads. Thus, head_dim * num_kv_heads < hidden_size 
+        # GQA uses fewer K/V heads than query heads, with the same head_dim.
+        # Neither combined attention width must equal hidden_size.
         self.k_proj = nn.Linear(self.hidden_size, self.head_dim * self.num_kv_heads, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.head_dim * self.num_kv_heads, bias=config.attention_bias)
 
@@ -139,7 +113,7 @@ class SelfAttention(nn.Module):
         k = k.repeat_interleave(self.num_kv_groups, dim=1) # repeats k, v heads since multiple q heads map to one k/v in GQA
         v = v.repeat_interleave(self.num_kv_groups, dim=1)
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) # transpose last 2 dims 
-        attn_scores = attn_scores / math.sqrt(self.head_dim) # scale by 1/sqrt(head_dim)
+        attn_scores = attn_scores * (self.head_dim ** -0.5) # scale by 1/sqrt(head_dim)
 
         attn_scores = attn_scores + attention_mask 
         attn_weights = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
@@ -350,11 +324,20 @@ class Qwen(nn.Module):
         if max_new_tokens <= 0:
             return input_ids
 
+        if input_ids.ndim != 2 or input_ids.shape[1] == 0:
+            raise ValueError("input_ids must contain a nonempty prompt")
         batch_size, query_len = input_ids.shape
         if padding_mask is None:
             padding_mask = torch.ones_like(input_ids, dtype=torch.bool)
         else:
             padding_mask = padding_mask.bool()
+
+        if padding_mask.shape != input_ids.shape:
+            raise ValueError("padding_mask must match input_ids")
+        if not padding_mask[:, -1].all() or (padding_mask[:, :-1] & ~padding_mask[:, 1:]).any():
+            raise ValueError("Use left padding with at least one real token per prompt")
+        if query_len + max_new_tokens - 1 > self.config.max_position_embeddings:
+            raise ValueError("Generation exceeds configured context range")
 
         cache = DynamicCache(
             config=self.config,
